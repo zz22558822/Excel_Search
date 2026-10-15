@@ -2,7 +2,7 @@
 """
 search_core.py — Excel / CSV 關鍵字搜尋核心
 
-不依賴 PyQt,可被 RUN_GUI_V2.py 呼叫,也可直接用命令列執行:
+不依賴 PyQt,可被呼叫,也可直接用命令列執行:
     python search_core.py "C:\\Users\\User\\Desktop" result.xlsx -k "google chrome" -k "microsoft edge"
 
 需要套件:  pip install pandas numpy openpyxl xlrd
