@@ -339,7 +339,7 @@ class MainWindow(QMainWindow):
     def __init__(self, app: QApplication):
         super().__init__()
         self.app = app
-        self.settings = QSettings("KeywordSearch", "RunGuiV2")
+        self.settings = QSettings("ExcelSearch", "GUI")
         self.worker: SearchThread | None = None
         self.result_path: str | None = None
         self.t0 = 0.0
