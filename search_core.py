@@ -14,21 +14,32 @@ import os
 import re
 import time
 import unicodedata
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
 import numpy as np
 import pandas as pd
+from openpyxl.utils import get_column_letter
 
 ALL_EXTS = (".csv", ".xlsx", ".xls")
 EXCEL_MAX_ROWS = 1_048_575          # 扣掉標題列
 CSV_CHUNK_ROWS = 200_000            # 大型 CSV 分塊讀取,避免一次吃光記憶體
 POOL_MIN_FILES = 6                  # 檔案數少於此值就不開多核心 (啟動成本不划算)
-META_COLUMNS = ("檔案路徑", "檔案名稱", "來源工作表", "資料列序", "命中關鍵字")
+HEADER_SCAN_ROWS = 30               # 只在工作表最上方這麼多列裡找標題列
+META_COLUMNS = ("檔案路徑", "檔案名稱", "來源工作表", "來源列號", "命中關鍵字")
+_RESERVED = META_COLUMNS + ("資料列序",)   # 原始資料若有同名欄位,會加上「_原始」
 _SEP = "\x1f"                       # 串接整列時的分隔字元,避免關鍵字跨儲存格誤判
 _ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_MIDNIGHT = re.compile(r"^(\d{4}-\d{2}-\d{2}) 00:00:00$")
+# 長得像「資料」而不是「欄位名稱」的儲存格:數字、版本號 (154.0.8037.98)、日期
+_DATA_LIKE = re.compile(
+    r"^(?:[+-]?\d+(?:[.,]\d+)*"
+    r"|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T].*)?"
+    r"|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}(?:[ T].*)?)$"
+)
 
 
 # ───────────────────────────── 資料結構 ─────────────────────────────
@@ -47,13 +58,28 @@ class SearchOptions:
     exts: tuple = ALL_EXTS
     recursive: bool = True
     skip_hidden: bool = True
+    auto_header: bool = True        # 自動判斷 Excel 工作表的標題列 (略過上方的標題文字、空白列)
+    merge_columns: bool = True      # 合併名稱相近、或沒有標題的欄位
+    aliases: tuple = ()             # 欄位別名,每項寫成 "版本=軟體版本"
+
+
+@dataclass
+class Part:
+    """一張工作表 (或 CSV 的一個區塊) 中符合的資料。"""
+    frame: pd.DataFrame             # 前 5 欄是 META_COLUMNS,後面是原始資料欄位
+    cols: list                      # 原始資料欄位名稱 (依序)
+    sheet: str
+    generic: bool                   # True = 找不到標題列,欄位以 欄A、欄B… 命名
+    header_row: Optional[int]       # 標題列在 Excel 中的列號 (1 開始);None = 沒有標題
 
 
 @dataclass
 class FileResult:
     path: str
-    frame: Optional[pd.DataFrame] = None
+    parts: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
     error: Optional[str] = None
+    skipped: bool = False           # True = 這是先前的搜尋結果檔,已略過
 
 
 @dataclass
@@ -65,6 +91,16 @@ class SearchSummary:
     elapsed: float
     output: Optional[str] = None
     preview: Optional[pd.DataFrame] = None
+
+
+@dataclass
+class Sheet:
+    name: Optional[str]
+    df: pd.DataFrame
+    rows: np.ndarray                # 每一列在原檔案中的列號 (Excel 開啟時看到的列號)
+    generic: bool
+    header_row: Optional[int]
+    header_cells: list = field(default_factory=list)   # 標題列的原始內容 (找不到標題時為空)
 
 
 # ───────────────────────────── 檔案蒐集 ─────────────────────────────
@@ -104,6 +140,120 @@ def collect_files(source: str, opts: SearchOptions, exclude: Optional[str] = Non
     return files
 
 
+# ───────────────────────────── 標題列與欄位名稱 ─────────────────────────────
+_CJK_GAP = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
+
+
+def normalize_header(s) -> str:
+    """欄位名稱正規化:全形轉半形、連續空白(含換行)合併、中文字之間的空白去掉、去頭尾空白。"""
+    s = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(s))).strip()
+    return _CJK_GAP.sub("", s)
+
+
+_ALIAS_SEP = re.compile(r"\s*(?:=|＝|->|→)\s*")
+
+
+def _split_alias(line) -> Optional[tuple]:
+    """把一行別名拆成 (別名, 標準名稱);格式不對回傳 None。必須剛好有一個分隔符號、兩邊都有字。"""
+    parts = _ALIAS_SEP.split(str(line).strip())
+    if len(parts) != 2:
+        return None
+    a, b = normalize_header(parts[0]), normalize_header(parts[1])
+    return (a, b) if a and b else None
+
+
+def validate_aliases(lines) -> list:
+    """回傳格式不正確的行 (空白行不算)。每行只能寫一組「別名=標準名稱」。"""
+    return [str(x).strip() for x in (lines or ()) if str(x).strip() and _split_alias(x) is None]
+
+
+def parse_aliases(lines) -> dict:
+    """把 ["版本=軟體版本", ...] 轉成 {正規化後的別名(小寫): 標準名稱}。格式不對的行會被略過。"""
+    out = {}
+    for line in lines or ():
+        pair = _split_alias(line)
+        if pair:
+            out[pair[0].casefold()] = pair[1]
+    return out
+
+
+def build_columns(names: list, aliases: dict) -> list:
+    """產生最終欄位名稱:正規化 → 套用別名 → 空白標題改叫「欄C」→ 重複的加 .2"""
+    out, seen = [], {}
+    for i, n in enumerate(names):
+        n = normalize_header(n)
+        n = aliases.get(n.casefold(), n)
+        if not n:
+            n = f"欄{get_column_letter(i + 1)}"
+        if n in seen:
+            seen[n] += 1
+            n = f"{n}.{seen[n]}"
+        else:
+            seen[n] = 0
+        out.append(n)
+    return out
+
+
+def find_header_row(raw: pd.DataFrame, max_scan: int = HEADER_SCAN_ROWS) -> Optional[int]:
+    """在最上方幾列找出「真正的標題列」,回傳 0 起算的位置;找不到回傳 None。
+
+    標題列的特徵:
+      1. 有填值的儲存格數量接近整張表的一般寬度 (合併儲存格的大標題通常只有 1 格,會被略過)
+      2. 內容像文字,不像數字、版本號或日期 (所以資料列不會被誤當成標題)
+    """
+    head = raw.iloc[:max_scan]
+    if head.empty:
+        return None
+    filled = head.apply(lambda c: c.str.strip().ne("")).to_numpy()
+    counts = filled.sum(axis=1)
+    nonzero = counts[counts > 0]
+    if nonzero.size == 0:
+        return None
+    ref = int(np.ceil(np.percentile(nonzero, 75)))
+    need = 1 if ref <= 1 else max(2, int(np.ceil(ref * 0.6)))
+    for i in range(len(head)):
+        if counts[i] < need:
+            continue
+        cells = [v.strip() for v in head.iloc[i] if v.strip()]
+        if any(_DATA_LIKE.match(v) for v in cells):
+            continue
+        return i
+    return None
+
+
+def _tidy_dates(raw: pd.DataFrame) -> pd.DataFrame:
+    """Excel 的日期儲存格讀進來會變成「2026-10-02 00:00:00」,把沒有時間的去掉 00:00:00。"""
+    for c in raw.columns:
+        s = raw[c]
+        if s.str.contains(" 00:00:00", regex=False).any():
+            raw[c] = s.str.replace(_MIDNIGHT, r"\1", regex=True)
+    return raw
+
+
+def prepare_sheet(name: Optional[str], raw: pd.DataFrame, opts: SearchOptions, aliases: dict,
+                  force_generic: bool = False) -> Sheet:
+    """把「沒有標題、從第 1 列開始」的原始表格,整理成有欄位名稱的資料表。"""
+    raw = _tidy_dates(raw.fillna("").astype(str))
+    h = None if force_generic else (find_header_row(raw) if opts.auto_header else 0)
+    generic = h is None
+    names = [""] * raw.shape[1] if generic else raw.iloc[h].tolist()
+    body = raw if generic else raw.iloc[h + 1:]
+    cols = build_columns(names, aliases)
+    # 沒有標題、而且整欄都是空白的欄位 (排版殘留) 直接丟掉
+    keep = [j for j in range(len(cols))
+            if normalize_header(names[j]) or body.iloc[:, j].str.strip().ne("").any()]
+    body = body.iloc[:, keep].copy()
+    body.columns = [cols[j] for j in keep]
+    rows = body.index.to_numpy() + 1        # raw 的列位置 0 起算 → Excel 列號
+    return Sheet(name, body, rows, generic, None if generic else h + 1,
+                 [] if generic else [str(v) for v in raw.iloc[h].tolist()])
+
+
+def _header_has_hit(cells: list, opts: SearchOptions) -> bool:
+    idx, _ = match_frame(pd.DataFrame([cells]), opts)
+    return len(idx) > 0
+
+
 # ───────────────────────────── 讀檔 ─────────────────────────────
 def detect_csv_encoding(path: str) -> str:
     """只解碼不解析,先找出能完整讀完整個檔案的編碼。"""
@@ -122,8 +272,8 @@ def detect_csv_encoding(path: str) -> str:
     return "latin-1"
 
 
-def iter_frames(path: str) -> Iterator[tuple]:
-    """逐塊產生 (工作表名稱或 None, DataFrame)。所有欄位都以字串讀入。"""
+def read_sheets(path: str, opts: SearchOptions, aliases: dict) -> Iterator[Sheet]:
+    """逐塊產生 Sheet。所有欄位都以字串讀入。"""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         enc = detect_csv_encoding(path)
@@ -131,13 +281,28 @@ def iter_frames(path: str) -> Iterator[tuple]:
             with pd.read_csv(path, dtype=str, encoding=enc, na_filter=False,
                              chunksize=CSV_CHUNK_ROWS) as reader:
                 for chunk in reader:
-                    yield None, chunk
+                    names = ["" if str(c).startswith("Unnamed: ") else c for c in chunk.columns]
+                    chunk.columns = build_columns(names, aliases)
+                    # 檔案第 1 行是標題,所以資料從第 2 行開始 (和用 Excel 開啟時看到的列號一致)
+                    yield Sheet(None, chunk, chunk.index.to_numpy() + 2, False, 1)
         except pd.errors.EmptyDataError:
             return
     else:
         with pd.ExcelFile(path) as xl:
             for sheet in xl.sheet_names:
-                yield sheet, pd.read_excel(xl, sheet_name=sheet, dtype=str, na_filter=False)
+                raw = pd.read_excel(xl, sheet_name=sheet, header=None, dtype=str, na_filter=False)
+                if raw.empty:
+                    continue
+                sh = prepare_sheet(sheet, raw, opts, aliases)
+                if sh.header_cells and _header_has_hit(sh.header_cells, opts):
+                    # 被判成標題的那一列其實含有關鍵字,多半是沒有標題的資料 → 保留成資料,避免漏掉
+                    sh = prepare_sheet(sheet, raw, opts, aliases, force_generic=True)
+                yield sh
+
+
+def is_result_columns(cols) -> bool:
+    """欄位同時有 檔案路徑 / 檔案名稱 / 命中關鍵字,就是本工具先前輸出的結果檔。"""
+    return {"檔案路徑", "檔案名稱", "命中關鍵字"} <= {str(c) for c in cols}
 
 
 # ───────────────────────────── 比對 ─────────────────────────────
@@ -203,30 +368,113 @@ def process_file(path: str, opts: SearchOptions) -> FileResult:
     """處理單一檔案 (會在子行程中執行,所以必須是模組層級函式)。"""
     try:
         name = os.path.basename(path)
+        aliases = parse_aliases(opts.aliases)
         parts = []
-        for sheet, df in iter_frames(path):
+        for sh in read_sheets(path, opts, aliases):
+            df = sh.df
+            if is_result_columns(df.columns):
+                # 先前搜尋產生的結果檔放在來源資料夾裡,不能再當成資料來源 (否則結果會重複、欄位也會錯亂)
+                return FileResult(path, notes=[f"已略過先前的搜尋結果檔:{name}"], skipped=True)
             if df.empty or df.shape[1] == 0:
                 continue
             idx, labels = match_frame(df, opts)
             if len(idx) == 0:
                 continue
             part = df.iloc[idx].copy()
-            row_seq = df.index[idx].to_numpy() + 1   # 第幾筆資料 (不含標題列)
-            part.columns = [f"{c}_原始" if str(c) in META_COLUMNS else str(c) for c in part.columns]
+            part.columns = [f"{c}_原始" if c in _RESERVED else c for c in part.columns]
             part.reset_index(drop=True, inplace=True)
             meta = pd.DataFrame({
                 "檔案路徑": path,
                 "檔案名稱": name,
-                "來源工作表": sheet or "",
-                "資料列序": row_seq,
+                "來源工作表": sh.name or "",
+                "來源列號": sh.rows[idx],
                 "命中關鍵字": labels,
             })
-            parts.append(pd.concat([meta, part], axis=1))
-        if not parts:
-            return FileResult(path)
-        return FileResult(path, pd.concat(parts, ignore_index=True, sort=False))
+            parts.append(Part(pd.concat([meta, part], axis=1), list(part.columns),
+                              sh.name or "", sh.generic, sh.header_row))
+        return FileResult(path, parts, _header_notes(name, parts))
     except Exception as e:  # noqa: BLE001
         return FileResult(path, error=str(e) or type(e).__name__)
+
+
+def _header_notes(name: str, parts: list) -> list:
+    """標題列不在第 1 列、或根本找不到標題時,留下一行說明,方便檢查。"""
+    moved = [p for p in parts if p.header_row not in (None, 1) and p.sheet]
+    nohdr = [p for p in parts if p.generic]
+    notes = []
+    if moved:
+        rows = sorted({p.header_row for p in moved})
+        notes.append(f"{name}:{len(moved)} 張工作表的標題列不在第 1 列 (在第 {'、'.join(map(str, rows))} 列),已自動判斷")
+    if nohdr:
+        notes.append(f"{name}:{len(nohdr)} 張工作表找不到標題列 ({'、'.join(p.sheet for p in nohdr[:4])}"
+                     f"{'…' if len(nohdr) > 4 else ''})")
+    return notes
+
+
+# ───────────────────────────── 欄位整理 ─────────────────────────────
+def reconcile_columns(parts: list) -> list:
+    """把「格式不太一樣」的工作表對齊到主流格式。就地修改 parts,回傳要顯示的訊息。
+
+    只處理兩種有把握的情況:
+      1. 找不到標題列的工作表 → 如果有欄位數相同的主流格式,依欄位位置套用它的標題
+      2. 某一欄的標題剛好等於工作表名稱 (常見於標題被誤改成工作表名稱),
+         而其餘欄位和主流格式完全相同 → 視為主流格式中同一位置的那一欄
+    其他情況不亂猜,請用「欄位別名」自行指定。
+    """
+    weight: Counter = Counter()     # 格式 → 命中筆數
+    count: Counter = Counter()      # 格式 → 出現在幾張工作表
+    for p in parts:
+        if not p.generic:
+            weight[tuple(p.cols)] += len(p.frame)
+            count[tuple(p.cols)] += 1
+    ranked = [s for s, _ in weight.most_common()]
+    messages, seen = [], set()
+
+    def dominant(width: int):
+        """同樣欄數的格式中,要明顯佔多數 (至少 3 張工作表、且過半) 才算主流格式。"""
+        same = [s for s in ranked if len(s) == width]
+        if not same:
+            return None
+        top = max(same, key=lambda s: count[s])
+        total = sum(count[s] for s in same)
+        return top if count[top] >= 3 and count[top] * 2 >= total else None
+
+    for p in parts:
+        cols = tuple(p.cols)
+        mapping, why = {}, ""
+        if p.generic:
+            top = dominant(len(cols))
+            if top:
+                mapping = dict(zip(cols, top))
+                why = f"工作表「{p.sheet}」沒有標題列,依欄位位置套用:{' / '.join(top)}"
+        elif len(cols) >= 3:
+            for s in ranked:
+                if s == cols or len(s) != len(cols) or weight[s] <= weight[cols]:
+                    continue
+                diff = [i for i, (a, b) in enumerate(zip(cols, s)) if a != b]
+                if (len(diff) == 1 and s[diff[0]] not in cols
+                        and normalize_header(cols[diff[0]]).casefold() == normalize_header(p.sheet).casefold()):
+                    mapping = {cols[diff[0]]: s[diff[0]]}
+                    why = f"工作表「{p.sheet}」的欄位標題「{cols[diff[0]]}」與工作表名稱相同,視為「{s[diff[0]]}」"
+                    break
+        if mapping:
+            p.frame.columns = [mapping.get(c, c) if c not in META_COLUMNS else c for c in p.frame.columns]
+            p.cols = [mapping.get(c, c) for c in p.cols]
+            if why and why not in seen:
+                seen.add(why)
+                messages.append(why)
+    return messages
+
+
+def ordered_columns(parts: list) -> list:
+    """資料欄位的排列順序:主流格式的欄位排前面。"""
+    weight: Counter = Counter()
+    for p in parts:
+        weight[tuple(p.cols)] += len(p.frame)
+    out: list = []
+    for cols, _ in weight.most_common():
+        out.extend(c for c in cols if c not in out)
+    return out
 
 
 # ───────────────────────────── 輸出 ─────────────────────────────
@@ -272,7 +520,6 @@ def write_output(final: pd.DataFrame, out: str, log: Callable = lambda *_: None)
             pass
 
     from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
 
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         final.to_excel(xw, index=False, sheet_name="結果")
@@ -311,6 +558,9 @@ def run_search(
 ) -> SearchSummary:
     t0 = time.time()
     clean_keywords(opts)  # 提早驗證
+    bad = validate_aliases(opts.aliases)
+    if bad:
+        raise SearchError("欄位別名格式不正確,每行只能寫一組「別名=標準名稱」:\n" + "\n".join(bad[:5]))
     files = collect_files(source, opts, exclude=output)
     total = len(files)
     on_progress(0, total, "")
@@ -335,10 +585,16 @@ def run_search(
         state["scanned"] += 1
         if res.error:
             on_log("err", f"讀取失敗  {res.path}: {res.error}")
-        elif res.frame is not None:
+        elif res.skipped:
+            for note in res.notes:
+                on_log("warn", note)
+        elif res.parts:
+            n = sum(len(p.frame) for p in res.parts)
             state["files"] += 1
-            state["rows"] += len(res.frame)
-            on_log("ok", f"找到符合項目  {res.path}  ({len(res.frame)} 筆)")
+            state["rows"] += n
+            on_log("ok", f"找到符合項目  {res.path}  ({n} 筆)")
+            for note in res.notes:
+                on_log("info", note)
         on_stats(state["scanned"], state["files"], state["rows"])
         on_progress(state["scanned"], total, res.path)
 
@@ -364,12 +620,21 @@ def run_search(
         return summary(cancelled=True, scanned=state["scanned"],
                        matched_files=state["files"], rows=state["rows"])
 
-    frames = [results[i].frame for i in sorted(results) if results[i].frame is not None]
-    if not frames:
+    parts = [p for i in sorted(results) for p in results[i].parts]
+    if not parts:
         on_log("warn", "未找到包含指定關鍵字的資料。")
         return summary(scanned=state["scanned"])
 
-    final = pd.concat(frames, ignore_index=True, sort=False)
+    if opts.merge_columns:
+        for msg in reconcile_columns(parts):
+            on_log("info", msg)
+    final = pd.concat([p.frame for p in parts], ignore_index=True, sort=False)
+    data_cols = ordered_columns(parts)
+    final = final[list(META_COLUMNS) + data_cols]
+    # 命中的資料列裡整欄都是空白的欄位 (例如沒有標題、只在其他列有內容的欄) 沒有參考價值,不輸出
+    blank = [c for c in data_cols if not final[c].fillna("").astype(str).str.strip().ne("").any()]
+    if blank:
+        final = final.drop(columns=blank)
     try:
         out = write_output(final, output, on_log)
     except PermissionError:
@@ -411,13 +676,17 @@ def _cli():
     ap.add_argument("--all", action="store_true", help="全部關鍵字都要出現")
     ap.add_argument("--width", action="store_true", help="全形半形視為相同")
     ap.add_argument("--no-recursive", action="store_true", help="不搜尋子資料夾")
+    ap.add_argument("--no-auto-header", action="store_true", help="一律把第 1 列當標題列")
+    ap.add_argument("--no-merge", action="store_true", help="不合併相近或沒有標題的欄位")
+    ap.add_argument("-a", "--alias", action="append", default=[], help='欄位別名,例如 -a "版本=軟體版本"')
     ap.add_argument("-j", "--jobs", type=int, default=0, help="行程數 (預設自動)")
     a = ap.parse_args()
 
     opts = SearchOptions(
         keywords=tuple(a.keyword), case_sensitive=a.case, whole=bool(a.whole),
         whole_mode=a.whole or "cell", match_all=a.all, normalize_width=a.width,
-        recursive=not a.no_recursive)
+        recursive=not a.no_recursive, auto_header=not a.no_auto_header,
+        merge_columns=not a.no_merge, aliases=tuple(a.alias))
     jobs = a.jobs or max(1, min(8, (os.cpu_count() or 2) - 1))
     try:
         r = run_search(a.source, a.output, opts, workers=jobs,

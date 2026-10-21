@@ -1,0 +1,33 @@
+# UTF-8
+
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),  # 檔案版本
+    prodvers=(1, 0, 0, 0),  # 產品版本
+    mask=0x0,
+    flags=0x0,
+    OS=0x4,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'00000404',  # 繁體中文語言代碼
+          [
+            StringStruct(u'CompanyName', u'Chek'),
+            StringStruct(u'FileDescription', u'Excel 搜尋工具'),
+            StringStruct(u'FileVersion', u'1.0.0.0'),
+            StringStruct(u'InternalName', u'Excel_Search_GUI'),
+            StringStruct(u'LegalCopyright', u'版權所有 © 2026 Chek. All rights reserved.'),
+            StringStruct(u'OriginalFilename', u'Excel_Search_GUI.exe'),
+            StringStruct(u'ProductVersion', u'1.0.0.0')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u'Translation', [0, 1028])])  # 繁體中文翻譯代碼
+  ]
+)

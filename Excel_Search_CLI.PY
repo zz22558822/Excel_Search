@@ -2,11 +2,11 @@ import os
 import pandas as pd
 
 # 設定資料夾路徑
-SOURCE_FOLDER = r"C:\Users\User\Desktop"
-OUTPUT_FILE = "matched_results.xlsx"
+SOURCE_FOLDER = r"C:\Users"
+OUTPUT_FILE = "Excel_Search_Results.xlsx"
 
 # 搜尋的關鍵字
-TARGET_KEYWORDS = ["google chrome", "microsoft edge"]
+TARGET_KEYWORDS = ["Google Chrome", "Microsoft Edge"]
 
 def search_files_and_extract(source_dir):
     all_matches = []
